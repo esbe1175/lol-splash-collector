@@ -1,0 +1,15 @@
+# Generated outputs
+output/
+output_*/
+
+# Download/materialization artifacts (if custom output-dir is used)
+dataset/
+dataset_dryrun/
+backups/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Temporary download artifacts
+*.part
