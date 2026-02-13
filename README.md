@@ -56,6 +56,12 @@ python build_splash_metadata.py \
   --force-redownload
 ```
 
+Optional strict validation mode (usually not needed with CDN-transcoded media):
+
+```bash
+python build_splash_metadata.py --materialize-assets --strict-size-check
+```
+
 Optional bounded run for testing:
 
 ```bash
@@ -83,7 +89,8 @@ python build_splash_metadata.py --materialize-assets --max-downloads 25
 - A URL group is treated as shared only when it maps to more than one unique champion.
 - Before every overwrite of `output/metadata.json`, the previous file is automatically backed up to `output/backups/metadata/`.
 - Downloading is conservative by default (4 workers, 2 requests/sec global cap, retries with backoff).
-- Existing files are skipped by default when they already match expected size; use `--force-redownload` to override.
+- Existing files are skipped by default when already present; use `--force-redownload` to override.
 - Retry attempts happen immediately per file (same worker task), not in a separate end-of-run retry queue.
 - Failed downloads are reported in end-of-run totals and per-file `<image>.metadata.json` with status/error details.
+- The wiki/CDN can serve a valid image with byte size different from API `imageinfo.size`; by default this is accepted and recorded as `downloaded_size_mismatch`.
 - You can rerun the script anytime after wiki updates; it rewrites metadata and tracks changes.

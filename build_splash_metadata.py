@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import requests
 
 
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.1.1"
 DEFAULT_BASE_URL = "https://wiki.leagueoflegends.com/en-us"
 SKINDATA_MODULE = "Module:SkinData/data"
 FILENAME_MODULE = "Module:Filename"
@@ -659,14 +659,45 @@ class RateLimiter:
             self.next_allowed = now + self.min_interval
 
 
-def maybe_skip_existing(image_path: Path, expected_size: Optional[int], force_redownload: bool) -> bool:
+def maybe_skip_existing(image_path: Path, force_redownload: bool) -> bool:
     if force_redownload:
         return False
     if not image_path.exists():
         return False
-    if expected_size is None:
-        return True
-    return image_path.stat().st_size == expected_size
+    return True
+
+
+def detect_image_format(data: bytes) -> Optional[str]:
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if len(data) >= 6 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def classify_download_error(error_text: str) -> str:
+    text = (error_text or "").lower()
+    if "429" in text:
+        return "rate_limited"
+    if "404" in text:
+        return "not_found"
+    if "403" in text:
+        return "forbidden"
+    if "5" in text and "http" in text:
+        return "server_error"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "connection" in text:
+        return "connection"
+    if "invalid image content" in text:
+        return "invalid_image"
+    if "size mismatch" in text:
+        return "size_mismatch"
+    return "other"
 
 
 def download_one_file(
@@ -677,6 +708,7 @@ def download_one_file(
     retries: int,
     retry_backoff_seconds: float,
     expected_size: Optional[int],
+    strict_size_check: bool,
 ) -> Dict[str, Any]:
     last_error: Optional[str] = None
     for attempt in range(1, retries + 1):
@@ -690,25 +722,41 @@ def download_one_file(
                 headers={"User-Agent": f"lol-splash-collector/{TOOL_VERSION}"},
             ) as response:
                 response.raise_for_status()
+                first_chunk: Optional[bytes] = None
                 with tmp_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
                         if chunk:
+                            if first_chunk is None:
+                                first_chunk = chunk
                             handle.write(chunk)
 
             downloaded_size = tmp_path.stat().st_size
-            if expected_size is not None and downloaded_size != expected_size:
+            if first_chunk is None:
+                first_chunk = b""
+
+            detected_format = detect_image_format(first_chunk)
+            if detected_format is None:
+                tmp_path.unlink(missing_ok=True)
+                raise RuntimeError("invalid image content (unknown signature)")
+
+            if strict_size_check and expected_size is not None and downloaded_size != expected_size:
                 tmp_path.unlink(missing_ok=True)
                 raise RuntimeError(
                     f"size mismatch (expected {expected_size}, got {downloaded_size})"
                 )
 
             tmp_path.replace(target_path)
+            size_mismatch = expected_size is not None and downloaded_size != expected_size
             return {
                 "ok": True,
-                "status": "downloaded",
+                "status": "downloaded_size_mismatch" if size_mismatch else "downloaded",
                 "size": target_path.stat().st_size,
                 "attempts": attempt,
                 "error": None,
+                "error_type": None,
+                "detected_format": detected_format,
+                "size_mismatch": size_mismatch,
+                "expected_size": expected_size,
             }
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
@@ -722,6 +770,10 @@ def download_one_file(
         "size": None,
         "attempts": retries,
         "error": last_error,
+        "error_type": classify_download_error(last_error or ""),
+        "detected_format": None,
+        "size_mismatch": False,
+        "expected_size": expected_size,
     }
 
 
@@ -737,6 +789,7 @@ def materialize_assets(
     retry_backoff_seconds: float,
     force_redownload: bool,
     max_downloads: int,
+    strict_size_check: bool,
 ) -> Dict[str, Any]:
     dataset_root = output_dir / ("dataset_dryrun" if dry_run else "dataset")
     dataset_root.mkdir(parents=True, exist_ok=True)
@@ -750,6 +803,8 @@ def materialize_assets(
     downloaded_count = 0
     skipped_existing_count = 0
     failed_count = 0
+    downloaded_with_size_mismatch_count = 0
+    failure_by_type: Dict[str, int] = {}
 
     tasks: List[Dict[str, Any]] = []
 
@@ -777,7 +832,11 @@ def materialize_assets(
             "metadata_path": str(metadata_path),
             "download_status": "pending",
             "error": None,
+            "error_type": None,
             "attempts": 0,
+            "detected_format": None,
+            "size_mismatch": False,
+            "expected_size": item.get("file_size"),
         }
 
         if dry_run:
@@ -787,7 +846,7 @@ def materialize_assets(
             continue
 
         expected_size = item.get("file_size")
-        if maybe_skip_existing(image_path, expected_size, force_redownload):
+        if maybe_skip_existing(image_path, force_redownload):
             skipped_existing_count += 1
             item["materialization"]["download_status"] = "skipped_exists"
             item["materialization"]["attempts"] = 0
@@ -824,6 +883,7 @@ def materialize_assets(
                     download_retries,
                     retry_backoff_seconds,
                     task["expected_size"],
+                    strict_size_check,
                 )
                 future_map[future] = task
 
@@ -844,12 +904,19 @@ def materialize_assets(
                 status = result["status"]
                 item["materialization"]["download_status"] = status
                 item["materialization"]["error"] = result.get("error")
+                item["materialization"]["error_type"] = result.get("error_type")
                 item["materialization"]["attempts"] = result.get("attempts", 0)
+                item["materialization"]["detected_format"] = result.get("detected_format")
+                item["materialization"]["size_mismatch"] = result.get("size_mismatch", False)
 
-                if status == "downloaded":
+                if status in ("downloaded", "downloaded_size_mismatch"):
                     downloaded_count += 1
+                    if status == "downloaded_size_mismatch":
+                        downloaded_with_size_mismatch_count += 1
                 elif status == "failed":
                     failed_count += 1
+                    et = result.get("error_type") or "other"
+                    failure_by_type[et] = failure_by_type.get(et, 0) + 1
 
                 elapsed = time.monotonic() - start
                 rate = completed / elapsed if elapsed > 0 else 0.0
@@ -882,6 +949,10 @@ def materialize_assets(
             "download_status": item["materialization"]["download_status"],
             "download_attempts": item["materialization"]["attempts"],
             "download_error": item["materialization"]["error"],
+            "download_error_type": item["materialization"]["error_type"],
+            "download_detected_format": item["materialization"]["detected_format"],
+            "download_size_mismatch_vs_api": item["materialization"]["size_mismatch"],
+            "download_expected_size_from_api": item["materialization"]["expected_size"],
         }
         metadata_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         wrote_metadata += 1
@@ -897,8 +968,10 @@ def materialize_assets(
         "local_image_missing": local_image_missing,
         "would_download_count": would_download,
         "downloaded_count": downloaded_count,
+        "downloaded_with_size_mismatch_count": downloaded_with_size_mismatch_count,
         "skipped_existing_count": skipped_existing_count,
         "failed_count": failed_count,
+        "failure_by_type": failure_by_type,
         "download_settings": {
             "workers": download_workers,
             "max_requests_per_second": max_requests_per_second,
@@ -907,6 +980,7 @@ def materialize_assets(
             "retry_backoff_seconds": retry_backoff_seconds,
             "force_redownload": force_redownload,
             "max_downloads": max_downloads,
+            "strict_size_check": strict_size_check,
         },
     }
 
@@ -967,6 +1041,11 @@ def main() -> None:
         default=0,
         help="Optional cap for number of files to download this run (0 means no cap).",
     )
+    parser.add_argument(
+        "--strict-size-check",
+        action="store_true",
+        help="Treat API file size mismatch as hard failure (disabled by default).",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
@@ -1013,6 +1092,7 @@ def main() -> None:
                 retry_backoff_seconds=max(0.1, args.retry_backoff_seconds),
                 force_redownload=args.force_redownload,
                 max_downloads=max(0, args.max_downloads),
+                strict_size_check=args.strict_size_check,
             )
         else:
             materialization_summary = materialize_assets(
@@ -1027,6 +1107,7 @@ def main() -> None:
                 retry_backoff_seconds=max(0.1, args.retry_backoff_seconds),
                 force_redownload=args.force_redownload,
                 max_downloads=max(0, args.max_downloads),
+                strict_size_check=args.strict_size_check,
             )
 
     metadata = {
@@ -1086,8 +1167,11 @@ def main() -> None:
     if materialization_summary is not None and not materialization_summary["dry_run"]:
         print(f"Dataset root: {materialization_summary['dataset_root']}")
         print(f"Downloaded: {materialization_summary['downloaded_count']}")
+        print(f"Downloaded with API size mismatch: {materialization_summary['downloaded_with_size_mismatch_count']}")
         print(f"Skipped existing: {materialization_summary['skipped_existing_count']}")
         print(f"Failed: {materialization_summary['failed_count']}")
+        if materialization_summary["failure_by_type"]:
+            print(f"Failure breakdown: {materialization_summary['failure_by_type']}")
 
 
 if __name__ == "__main__":
