@@ -2,6 +2,16 @@
 
 Builds and updates a local splash metadata database from the LoL wiki, with optional image downloads.
 
+## Prebuilt Dataset (Hugging Face)
+
+You can download a prebuilt copy from [rconhf/lol-splash on Hugging Face](https://huggingface.co/datasets/rconhf/lol-splash) and place it in `./output/dataset`.
+
+This can be used:
+- as a base for incremental updates with this tool, or
+- on its own if you only need the collected files.
+
+**Status:** up to date as of **13/02/2026**.
+
 ## What it does
 
 - Fetches `Module:SkinData/data` and `Module:Filename` revision metadata.
