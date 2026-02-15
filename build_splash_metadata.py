@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import datetime as dt
 import hashlib
 import json
@@ -598,7 +599,7 @@ def build_artifact_records(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]
         canonical_chosen = canonical["splash_resolution"]["chosen"] or {}
         file_name = canonical_chosen.get("file_name") or f"{stable_hash(url)}.jpg"
         group_id = stable_hash(url)
-        folder = f"shared/{group_id}" if is_true_group else safe_filename(canonical["champion"])
+        folder = "shared" if is_true_group else safe_filename(canonical["champion"])
 
         artifacts.append(
             {
@@ -614,6 +615,7 @@ def build_artifact_records(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     "skin": canonical["skin"],
                     "release": canonical.get("data", {}).get("release"),
                     "splashartist": canonical.get("data", {}).get("splashartist"),
+                    "skin_data": canonical.get("data", {}),
                 },
                 "file_name": file_name,
                 "file_sha1": canonical_chosen.get("sha1"),
@@ -625,6 +627,7 @@ def build_artifact_records(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]
                         "champion": e["champion"],
                         "skin": e["skin"],
                         "release": e.get("data", {}).get("release"),
+                        "skin_data": e.get("data", {}),
                     }
                     for e in sorted(group_entries, key=lambda x: (x["champion"], x["skin"]))
                 ],
@@ -698,6 +701,168 @@ def classify_download_error(error_text: str) -> str:
     if "size mismatch" in text:
         return "size_mismatch"
     return "other"
+
+
+def ensure_unique_output_name(
+    folder_name: str,
+    requested_name: str,
+    folder_name_registry: Dict[str, Dict[str, str]],
+    artifact_id: str,
+) -> str:
+    requested_name = safe_filename(requested_name)
+    folder_registry = folder_name_registry.setdefault(folder_name, {})
+    current_owner = folder_registry.get(requested_name)
+    if current_owner is None or current_owner == artifact_id:
+        folder_registry[requested_name] = artifact_id
+        return requested_name
+
+    stem, suffix = Path(requested_name).stem, Path(requested_name).suffix
+    candidate = f"{stem}__{artifact_id[:8]}{suffix}"
+    idx = 2
+    while candidate in folder_registry and folder_registry[candidate] != artifact_id:
+        candidate = f"{stem}__{artifact_id[:8]}_{idx}{suffix}"
+        idx += 1
+    folder_registry[candidate] = artifact_id
+    return candidate
+
+
+def normalize_string(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def list_to_pipe(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    return "|".join(str(x) for x in value)
+
+
+def to_int_or_zero(value: Any) -> int:
+    try:
+        if value is None:
+            return 0
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def export_hf_bundle(
+    base_dir: Path,
+    artifacts: List[Dict[str, Any]],
+    metadata_generated_at: str,
+    source_modules: Dict[str, Any],
+) -> Dict[str, Any]:
+    hf_root = base_dir / "hf"
+    hf_root.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        canonical = artifact.get("canonical_entry", {})
+        canonical_data = canonical.get("skin_data", {}) if isinstance(canonical.get("skin_data"), dict) else {}
+        for entry in artifact.get("entries", []):
+            skin_data = entry.get("skin_data", {}) if isinstance(entry.get("skin_data"), dict) else {}
+            rows.append(
+                {
+                    "artifact_id": artifact.get("artifact_id", ""),
+                    "resolved_url": artifact.get("resolved_url", ""),
+                    "is_shared_multi_champion": bool(artifact.get("is_shared_multi_champion", False)),
+                    "folder": artifact.get("folder", ""),
+                    "output_file_name": artifact.get("output_file_name", artifact.get("file_name", "")),
+                    "entry_count": int(artifact.get("entry_count", 0)),
+                    "file_sha1": normalize_string(artifact.get("file_sha1")),
+                    "file_mime": normalize_string(artifact.get("file_mime")),
+                    "file_size": to_int_or_zero(artifact.get("file_size")),
+                    "canonical_key": canonical.get("key", ""),
+                    "canonical_champion": canonical.get("champion", ""),
+                    "canonical_skin": canonical.get("skin", ""),
+                    "canonical_release": normalize_string(canonical.get("release")),
+                    "canonical_set": list_to_pipe(canonical_data.get("set")),
+                    "canonical_splashartist": list_to_pipe(canonical_data.get("splashartist")),
+                    "entry_key": entry.get("key", ""),
+                    "champion": entry.get("champion", ""),
+                    "skin": entry.get("skin", ""),
+                    "release": normalize_string(entry.get("release")),
+                    "set": list_to_pipe(skin_data.get("set")),
+                    "splashartist": list_to_pipe(skin_data.get("splashartist")),
+                    "availability": normalize_string(skin_data.get("availability")),
+                    "cost": to_int_or_zero(skin_data.get("cost")),
+                    "generated_at_utc": metadata_generated_at,
+                    "source_skindata_revid": to_int_or_zero((source_modules.get("Module:SkinData/data") or {}).get("revid")),
+                }
+            )
+
+    jsonl_path = hf_root / "records.jsonl"
+    csv_path = hf_root / "records.csv"
+    parquet_path = hf_root / "records.parquet"
+    write_jsonl(jsonl_path, rows)
+
+    if rows:
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        csv_path.write_text("", encoding="utf-8")
+
+    parquet_written = False
+    parquet_error = ""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.Table.from_pylist(rows)
+        pq.write_table(table, parquet_path)
+        parquet_written = True
+    except Exception as exc:  # noqa: BLE001
+        parquet_error = str(exc)
+
+    data_file = "hf/records.parquet" if parquet_written else "hf/records.jsonl"
+    source_repo_url = "https://github.com/esbe1175/lol-splash-collector"
+    skindata_rev = (source_modules.get("Module:SkinData/data") or {}).get("revid")
+    filename_rev = (source_modules.get("Module:Filename") or {}).get("revid")
+    card_text = (
+        "---\n"
+        "configs:\n"
+        "  - config_name: default\n"
+        "    data_files:\n"
+        "      - split: train\n"
+        f"        path: {data_file}\n"
+        "---\n\n"
+        "# lol-splash-collector dataset export\n\n"
+        f"Up to date as of **{metadata_generated_at}** (UTC).\n\n"
+        f"Generated with [esbe1175/lol-splash-collector]({source_repo_url}).\n\n"
+        "Source wiki module revisions used:\n\n"
+        f"- `Module:SkinData/data`: `{skindata_rev}`\n"
+        f"- `Module:Filename`: `{filename_rev}`\n\n"
+        "- `hf/records.jsonl`: line-delimited records for each champion-skin row.\n"
+        "- `hf/records.csv`: tabular export for spreadsheet usage.\n"
+        "- `hf/records.parquet`: parquet export (written when pyarrow is available).\n"
+    )
+    (hf_root / "README.md").write_text(card_text, encoding="utf-8")
+    (base_dir / "README.md").write_text(card_text, encoding="utf-8")
+
+    summary = {
+        "hf_root": str(hf_root),
+        "row_count": len(rows),
+        "jsonl_path": str(jsonl_path),
+        "csv_path": str(csv_path),
+        "parquet_path": str(parquet_path) if parquet_written else None,
+        "parquet_written": parquet_written,
+        "parquet_error": parquet_error,
+        "card_path": str(hf_root / "README.md"),
+        "root_card_path": str(base_dir / "README.md"),
+    }
+    (hf_root / "export_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return summary
 
 
 def download_one_file(
@@ -805,6 +970,7 @@ def materialize_assets(
     failed_count = 0
     downloaded_with_size_mismatch_count = 0
     failure_by_type: Dict[str, int] = {}
+    folder_name_registry: Dict[str, Dict[str, str]] = {}
 
     tasks: List[Dict[str, Any]] = []
 
@@ -814,7 +980,13 @@ def materialize_assets(
             created_folders += 1
         folder_path.mkdir(parents=True, exist_ok=True)
 
-        image_file_name = safe_filename(item["file_name"])
+        image_file_name = ensure_unique_output_name(
+            folder_name=item["folder"],
+            requested_name=item["file_name"],
+            folder_name_registry=folder_name_registry,
+            artifact_id=item["artifact_id"],
+        )
+        item["output_file_name"] = image_file_name
         image_path = folder_path / image_file_name
         image_exists = image_path.exists()
         if image_exists:
@@ -831,10 +1003,10 @@ def materialize_assets(
             "shortcut_path": str(shortcut_path) if dry_run else None,
             "metadata_path": str(metadata_path),
             "download_status": "pending",
-            "error": None,
-            "error_type": None,
+            "error": "",
+            "error_type": "",
             "attempts": 0,
-            "detected_format": None,
+            "detected_format": "",
             "size_mismatch": False,
             "expected_size": item.get("file_size"),
         }
@@ -903,10 +1075,10 @@ def materialize_assets(
 
                 status = result["status"]
                 item["materialization"]["download_status"] = status
-                item["materialization"]["error"] = result.get("error")
-                item["materialization"]["error_type"] = result.get("error_type")
+                item["materialization"]["error"] = normalize_string(result.get("error"))
+                item["materialization"]["error_type"] = normalize_string(result.get("error_type"))
                 item["materialization"]["attempts"] = result.get("attempts", 0)
-                item["materialization"]["detected_format"] = result.get("detected_format")
+                item["materialization"]["detected_format"] = normalize_string(result.get("detected_format"))
                 item["materialization"]["size_mismatch"] = result.get("size_mismatch", False)
 
                 if status in ("downloaded", "downloaded_size_mismatch"):
@@ -1046,6 +1218,11 @@ def main() -> None:
         action="store_true",
         help="Treat API file size mismatch as hard failure (disabled by default).",
     )
+    parser.add_argument(
+        "--skip-hf-export",
+        action="store_true",
+        help="Skip writing Hugging Face-friendly tabular exports under output/hf.",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
@@ -1152,6 +1329,19 @@ def main() -> None:
     if materialization_summary is not None:
         metadata["materialization"] = materialization_summary
 
+    hf_export_summary = None
+    if not args.skip_hf_export:
+        hf_base_dir = output_dir
+        if materialization_summary is not None:
+            hf_base_dir = Path(materialization_summary["dataset_root"])
+        hf_export_summary = export_hf_bundle(
+            base_dir=hf_base_dir,
+            artifacts=artifacts,
+            metadata_generated_at=metadata["generated_at_utc"],
+            source_modules=source_modules,
+        )
+        metadata["hf_export"] = hf_export_summary
+
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Wrote metadata: {metadata_path}")
     print(f"Entries: {metadata['stats']['skin_entry_count']}")
@@ -1172,6 +1362,12 @@ def main() -> None:
         print(f"Failed: {materialization_summary['failed_count']}")
         if materialization_summary["failure_by_type"]:
             print(f"Failure breakdown: {materialization_summary['failure_by_type']}")
+    if hf_export_summary is not None:
+        print(f"HF export rows: {hf_export_summary['row_count']}")
+        if hf_export_summary["parquet_written"]:
+            print(f"HF parquet: {hf_export_summary['parquet_path']}")
+        else:
+            print("HF parquet: not written (pyarrow unavailable)")
 
 
 if __name__ == "__main__":

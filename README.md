@@ -23,6 +23,7 @@ This can be used:
   4. `.png`
 - Matches skins by **resolved URL** to detect shared splash artwork groups.
 - Picks canonical metadata per resolved image using the **oldest release date** in that URL group.
+- Preserves full source skin metadata in per-art records (including keys like `set`).
 - Writes update/diff/version information so reruns can detect changes.
 
 ## Run metadata build
@@ -35,6 +36,12 @@ Optional:
 
 ```bash
 python build_splash_metadata.py --output-dir output --metadata-name metadata.json
+```
+
+Skip Hugging Face tabular export generation:
+
+```bash
+python build_splash_metadata.py --skip-hf-export
 ```
 
 ## Run dry-run dataset materialization
@@ -90,6 +97,14 @@ python build_splash_metadata.py --materialize-assets --max-downloads 25
   Per-art download output:
   - `<image>` (downloaded image)
   - `<image>.metadata.json` (canonical metadata for that image)
+- `<output_base>/hf/...`  
+  Hugging Face-friendly tabular exports (`<output_base>` is `output/` for metadata-only runs, or `output/dataset/` when `--materialize-assets` is used):
+  - `records.jsonl`
+  - `records.csv`
+  - `records.parquet` (when `pyarrow` is available)
+  - `README.md` dataset card template with `data_files` config
+- `<output_base>/README.md`  
+  Root dataset card for Hugging Face viewer compatibility (points `data_files` at `hf/records.*`).
 
 ## Notes
 
@@ -97,6 +112,7 @@ python build_splash_metadata.py --materialize-assets --max-downloads 25
 - `.url` shortcut files are created only in dry-run mode (`output/dataset_dryrun/...`).
 - Grouping uses resolved URL returned by MediaWiki `imageinfo`.
 - A URL group is treated as shared only when it maps to more than one unique champion.
+- Shared outputs are flattened into a single `shared/` directory (with collision-safe naming when needed).
 - Before every overwrite of `output/metadata.json`, the previous file is automatically backed up to `output/backups/metadata/`.
 - Downloading is conservative by default (4 workers, 2 requests/sec global cap, retries with backoff).
 - Existing files are skipped by default when already present; use `--force-redownload` to override.
